@@ -1,9 +1,11 @@
 import os, sys
+import time
 import torch
 import torch.nn as nn
 from torch.nn.functional import one_hot, binary_cross_entropy, cross_entropy
 from torch.nn.utils.clip_grad import clip_grad_norm_
 import numpy as np
+from tqdm import tqdm
 from .evaluate_model import evaluate
 from torch.autograd import Variable, grad
 from .atkt import _l2_normalize_adv
@@ -290,9 +292,23 @@ def train_model(model, train_loader, valid_loader, num_epochs, opt, ckpt_path, t
 
     if model.model_name=='lpkt':
         scheduler = torch.optim.lr_scheduler.StepLR(opt, 10, gamma=0.5)
+
+    # ========== 训练启动横幅 ==========
+    print(f"\n{'='*70}")
+    print(f"  模型: {model.model_name}  |  嵌入类型: {model.emb_type}  |  总轮数: {num_epochs}  |  设备: {device}")
+    print(f"  保存路径: {ckpt_path}")
+    print(f"{'='*70}\n")
+
+    total_start = time.time()
     for i in range(1, num_epochs + 1):
+        epoch_start = time.time()
         loss_mean = []
-        for data in train_loader:
+
+        # 每轮 batch 进度条
+        pbar = tqdm(train_loader, desc=f"Epoch {i:3d}/{num_epochs}", leave=False,
+                    bar_format='{l_bar}{bar:30}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}')
+
+        for data in pbar:
             train_step+=1
             if model.model_name in que_type_models and model.model_name not in ["lpkt", "rkt"]:
                 model.model.train()
@@ -310,16 +326,23 @@ def train_model(model, train_loader, valid_loader, num_epochs, opt, ckpt_path, t
                 clip_grad_norm_(model.parameters(), model.grad_clip)
             if model.model_name == "dtransformer":
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            opt.step()#update model’s parameters
-                
-            loss_mean.append(loss.detach().cpu().numpy())
+            opt.step()#update model's parameters
+
+            loss_val = loss.detach().cpu().numpy()
+            loss_mean.append(loss_val)
+            pbar.set_postfix(loss=f"{loss_val:.4f}")
+
             if model.model_name == "gkt" and train_step%10==0:
                 text = f"Total train step is {train_step}, the loss is {loss.item():.5}"
                 debug_print(text = text,fuc_name="train_model")
+
         if model.model_name=='lpkt':
             scheduler.step()#update each epoch
+
+        epoch_time = time.time() - epoch_start
+        batches_per_sec = len(train_loader) / epoch_time if epoch_time > 0 else 0
         loss_mean = np.mean(loss_mean)
-        
+
         if model.model_name=='rkt':
             auc, acc = evaluate(model, valid_loader, model.model_name, rel)
         else:
@@ -342,10 +365,24 @@ def train_model(model, train_loader, valid_loader, num_epochs, opt, ckpt_path, t
                     save_test_path = os.path.join(ckpt_path, model.emb_type+"_test_window_predictions.txt")
                     window_testauc, window_testacc = evaluate(model, test_window_loader, model.model_name, save_test_path)
             validauc, validacc = auc, acc
-        print(f"Epoch: {i}, validauc: {validauc:.4}, validacc: {validacc:.4}, best epoch: {best_epoch}, best auc: {max_auc:.4}, train loss: {loss_mean}, emb_type: {model.emb_type}, model: {model.model_name}, save_dir: {ckpt_path}")
-        print(f"            testauc: {round(testauc,4)}, testacc: {round(testacc,4)}, window_testauc: {round(window_testauc,4)}, window_testacc: {round(window_testacc,4)}")
 
+        # ========== 每轮汇总行 ==========
+        best_mark = "★" if best_epoch == i else " "
+        early_stop_cnt = i - best_epoch
+        print(f"{best_mark} Epoch {i:3d}/{num_epochs} | loss: {loss_mean:.4f} | val auc: {auc:.4f}  val acc: {acc:.4f} | best_auc: {max_auc:.4f} (ep {best_epoch}) | {epoch_time:.1f}s  {batches_per_sec:.1f}it/s | 早停计数: {early_stop_cnt}/10")
 
         if i - best_epoch >= 10:
+            print(f"\n  ⏹ 第 {i} 轮早停（连续 10 轮无提升）\n")
             break
+
+    # ========== 训练完成汇总 ==========
+    total_time = time.time() - total_start
+    print(f"\n{'='*70}")
+    print(f"  训练完成！")
+    print(f"  最佳轮次: {best_epoch}  |  验证 AUC: {max_auc:.4f}  |  验证 ACC: {validacc:.4f}")
+    print(f"  测试 AUC: {testauc:.4f}  |  测试 ACC: {testacc:.4f}")
+    print(f"  窗口测试 AUC: {window_testauc:.4f}  |  窗口测试 ACC: {window_testacc:.4f}")
+    print(f"  总耗时: {total_time:.1f}s  |  保存路径: {ckpt_path}")
+    print(f"{'='*70}\n")
+
     return testauc, testacc, window_testauc, window_testacc, validauc, validacc, best_epoch
